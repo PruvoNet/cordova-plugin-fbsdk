@@ -33,9 +33,15 @@ Utilities.getPlistPath = function (context) {
   const common = context.requireCordovaModule('cordova-common');
   const util = context.requireCordovaModule('cordova-lib/src/cordova/util');
   const projectName = new common.ConfigParser(util.projectConfig(util.isCordova())).name();
-  // cordova-ios 8.0.0 renamed the project directory from the app name to 'App'
-  const dirName = fs.existsSync('./platforms/ios/' + projectName) ? projectName : 'App';
-  return './platforms/ios/' + dirName + '/' + dirName + '-Info.plist'
+  
+  // cordova-ios < 8.0.0: platforms/ios/<ProjectName>/<ProjectName>-Info.plist
+  const legacyPath = './platforms/ios/' + projectName + '/' + projectName + '-Info.plist';
+  if (fs.existsSync(legacyPath)) {
+    return legacyPath;
+  }
+  
+  // cordova-ios 8.0.0+: platforms/ios/App/Info.plist
+  return './platforms/ios/App/Info.plist';
 }
 
 module.exports = Utilities;
