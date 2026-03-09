@@ -32,18 +32,29 @@
 - (void)pluginInitialize {
     NSLog(@"Starting Facebook Connect plugin");
 
-    // Add notification listener for tracking app activity with FB Events
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(applicationDidFinishLaunching:)
-                                                 name:UIApplicationDidFinishLaunchingNotification object:nil];
+    // cordova-ios 8.0.0+ uses a scene-based lifecycle where
+    // UIApplicationDidFinishLaunchingNotification fires before plugins are initialized.
+    // Always initialize the SDK directly — safe to call multiple times.
+    [[FBSDKApplicationDelegate sharedInstance] application:[UIApplication sharedApplication]
+                             didFinishLaunchingWithOptions:@{}];
+    [FBSDKProfile enableUpdatesOnAccessTokenChange:YES];
 
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(applicationDidBecomeActive:)
-                                                 name:UIApplicationDidBecomeActiveNotification object:nil];
+    // FBSDK 18.x lazily reads appID from the plist but may not have it cached yet
+    // when the scene-based lifecycle re-orders initialization. Explicitly set them.
+    NSBundle *mainBundle = [NSBundle mainBundle];
+    NSString *plistAppID = [mainBundle objectForInfoDictionaryKey:@"FacebookAppID"];
+    NSString *plistClientToken = [mainBundle objectForInfoDictionaryKey:@"FacebookClientToken"];
+    NSString *plistDisplayName = [mainBundle objectForInfoDictionaryKey:@"FacebookDisplayName"];
 
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                         selector:@selector(handleOpenURLWithAppSourceAndAnnotation:)
-                                             name:CDVPluginHandleOpenURLWithAppSourceAndAnnotationNotification object:nil];
+    if (!FBSDKSettings.sharedSettings.appID.length && plistAppID.length) {
+        [FBSDKSettings.sharedSettings setAppID:plistAppID];
+    }
+    if (!FBSDKSettings.sharedSettings.clientToken.length && plistClientToken.length) {
+        [FBSDKSettings.sharedSettings setClientToken:plistClientToken];
+    }
+    if (!FBSDKSettings.sharedSettings.displayName.length && plistDisplayName.length) {
+        [FBSDKSettings.sharedSettings setDisplayName:plistDisplayName];
+    }
 }
 
 - (void) applicationDidFinishLaunching:(NSNotification *) notification {
