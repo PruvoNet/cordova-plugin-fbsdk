@@ -12,6 +12,7 @@
 
 #import "FacebookConnectPlugin.h"
 #import <objc/runtime.h>
+#import <AppTrackingTransparency/AppTrackingTransparency.h>
 
 @interface FacebookConnectPlugin ()
 
@@ -23,27 +24,16 @@
 
 - (NSDictionary *)loginResponseObject;
 - (NSDictionary *)limitedLoginResponseObject;
+- (NSDictionary *)limitedLoginCompatibleResponseObject;
 - (NSDictionary *)profileObject;
 - (void)enableHybridAppEvents;
+- (void)performLimitedLogin:(CDVInvokedUrlCommand *)command permissions:(NSArray *)permissions;
 @end
 
 @implementation FacebookConnectPlugin
 
 - (void)pluginInitialize {
     NSLog(@"Starting Facebook Connect plugin");
-
-    // One-time migration: clear stale cached tokens from before the cordova-ios 8.0.0
-    // URL callback fix. Without proper notification observers the FBSDK stored invalid
-    // credentials that Facebook's Graph API rejects with "Cannot parse access token".
-    static NSString *const kTokenMigrationKey = @"fbsdk_cordovaios8_token_cleared_v1";
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kTokenMigrationKey]) {
-        NSLog(@"FB: Clearing stale cached token (one-time cordova-ios 8 migration)");
-        [FBSDKAccessToken setCurrentAccessToken:nil];
-        [FBSDKAuthenticationToken setCurrentAuthenticationToken:nil];
-        [FBSDKProfile setCurrentProfile:nil];
-        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kTokenMigrationKey];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-    }
 
     // cordova-ios 8.0.0+ uses a scene-based lifecycle where
     // UIApplicationDidFinishLaunchingNotification fires before plugins are initialized.
@@ -115,7 +105,6 @@
 - (void) handleOpenURL:(NSNotification *) notification {
     NSURL *url = notification.object;
     NSDictionary *options = notification.userInfo ?: @{};
-    NSLog(@"FB handleOpenURL (new): url=%@ sourceApp=%@", url, options[@"sourceApplication"] ?: @"(nil)");
     [[FBSDKApplicationDelegate sharedInstance] application:[UIApplication sharedApplication] openURL:url options:options];
 }
 
@@ -123,7 +112,7 @@
 - (void) handleOpenURLWithAppSourceAndAnnotation:(NSNotification *) notification {
     NSMutableDictionary * options = [notification object];
     NSURL* url = options[@"url"];
-    NSLog(@"FB handleOpenURLWithAppSourceAndAnnotation (legacy): url=%@", url);
+
     [[FBSDKApplicationDelegate sharedInstance] application:[UIApplication sharedApplication] openURL:url options:options];
 }
 
@@ -184,23 +173,35 @@
 }
 
 - (void)getLoginStatus:(CDVInvokedUrlCommand *)command {
-    if (self.loginTracking == FBSDKLoginTrackingLimited) {
-        [self returnLimitedLoginMethodError:command.callbackId];
-        return;
-    }
-    
-    BOOL force = [[command argumentAtIndex:0] boolValue];
-    if (force) {
-        [FBSDKAccessToken refreshCurrentAccessTokenWithCompletion:^(id<FBSDKGraphRequestConnecting>  _Nullable connection, id  _Nullable result, NSError * _Nullable error) {
+    // Standard access token takes priority
+    if ([FBSDKAccessToken currentAccessToken] && self.loginTracking != FBSDKLoginTrackingLimited) {
+        BOOL force = [[command argumentAtIndex:0] boolValue];
+        if (force) {
+            [FBSDKAccessToken refreshCurrentAccessTokenWithCompletion:^(id<FBSDKGraphRequestConnecting>  _Nullable connection, id  _Nullable result, NSError * _Nullable error) {
+                CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                              messageAsDictionary:[self loginResponseObject]];
+                [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+            }];
+        } else {
             CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
                                                           messageAsDictionary:[self loginResponseObject]];
             [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
-        }];
-    } else {
-        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
-                                                      messageAsDictionary:[self loginResponseObject]];
-        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        }
+        return;
     }
+
+    // Fall back to Limited Login JWT if available
+    if ([FBSDKAuthenticationToken currentAuthenticationToken]) {
+        CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                      messageAsDictionary:[self limitedLoginCompatibleResponseObject]];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        return;
+    }
+
+    // No active session
+    CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                  messageAsDictionary:@{@"status": @"unknown"}];
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
 - (void)getAccessToken:(CDVInvokedUrlCommand *)command {
@@ -387,6 +388,16 @@
             permissions = @[];
         }
 
+        // When ATT is not authorized, FBSDK 17+ returns opaque tokens that the
+        // Graph API rejects. Use Limited Login (OIDC JWT) instead.
+        if (@available(iOS 14, *)) {
+            ATTrackingManagerAuthorizationStatus attStatus = [ATTrackingManager trackingAuthorizationStatus];
+            if (attStatus != ATTrackingManagerAuthorizationStatusAuthorized) {
+                [self performLimitedLogin:command permissions:permissions];
+                return;
+            }
+        }
+
         if (self.loginManager == nil || self.loginTracking == FBSDKLoginTrackingLimited) {
             self.loginManager = [[FBSDKLoginManager alloc] init];
         }
@@ -449,6 +460,37 @@
     }
     self.loginTracking = FBSDKLoginTrackingLimited;
     FBSDKLoginConfiguration *configuration = [[FBSDKLoginConfiguration alloc] initWithPermissions:permissionsArray tracking:FBSDKLoginTrackingLimited nonce:nonce];
+    [self.loginManager logInFromViewController:[self topMostController] configuration:configuration completion:loginHandler];
+}
+
+// Automatically invoked by login: when ATT is not authorized.
+// Uses Limited Login and returns the OIDC JWT in the accessToken field
+// so the JS client can consume it without changes.
+- (void)performLimitedLogin:(CDVInvokedUrlCommand *)command permissions:(NSArray *)permissions {
+    NSString *nonce = [[NSUUID UUID] UUIDString];
+
+    FBSDKLoginManagerLoginResultBlock loginHandler = ^void(FBSDKLoginManagerLoginResult *result, NSError *error) {
+        if (error) {
+            NSString *errorCode = @"-2";
+            NSString *errorMessage = error.userInfo[FBSDKErrorLocalizedDescriptionKey];
+            [self returnLoginError:command.callbackId:errorCode:errorMessage];
+            return;
+        } else if (result.isCancelled) {
+            NSString *errorCode = @"4201";
+            NSString *errorMessage = @"User cancelled.";
+            [self returnLoginError:command.callbackId:errorCode:errorMessage];
+        } else {
+            CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                          messageAsDictionary:[self limitedLoginCompatibleResponseObject]];
+            [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        }
+    };
+
+    if (self.loginManager == nil || self.loginTracking == FBSDKLoginTrackingEnabled) {
+        self.loginManager = [FBSDKLoginManager new];
+    }
+    self.loginTracking = FBSDKLoginTrackingLimited;
+    FBSDKLoginConfiguration *configuration = [[FBSDKLoginConfiguration alloc] initWithPermissions:permissions tracking:FBSDKLoginTrackingLimited nonce:nonce];
     [self.loginManager logInFromViewController:[self topMostController] configuration:configuration completion:loginHandler];
 }
 
@@ -528,8 +570,7 @@
 
 - (void) logout:(CDVInvokedUrlCommand*)command
 {
-    if ([FBSDKAccessToken currentAccessToken]) {
-        // Close the session and clear the cache
+    if ([FBSDKAccessToken currentAccessToken] || [FBSDKAuthenticationToken currentAuthenticationToken]) {
         if (self.loginManager == nil) {
             self.loginManager = [[FBSDKLoginManager alloc] init];
         }
@@ -540,7 +581,11 @@
         [self.loginManager logOut];
     }
 
-    // Else just return OK we are already logged out
+    // Also clear Limited Login tokens explicitly
+    [FBSDKAccessToken setCurrentAccessToken:nil];
+    [FBSDKAuthenticationToken setCurrentAuthenticationToken:nil];
+    [FBSDKProfile setCurrentProfile:nil];
+
     [self returnGenericSuccess:command.callbackId];
 }
 
@@ -882,18 +927,11 @@
 - (NSDictionary *)loginResponseObject {
 
     if (![FBSDKAccessToken currentAccessToken]) {
-        NSLog(@"FB loginResponseObject: currentAccessToken is nil — returning unknown");
         return @{@"status": @"unknown"};
     }
 
     NSMutableDictionary *response = [[NSMutableDictionary alloc] init];
     FBSDKAccessToken *token = [FBSDKAccessToken currentAccessToken];
-
-    NSLog(@"FB loginResponseObject: tokenString prefix=%@ length=%lu userID=%@ appID=%@",
-          token.tokenString.length > 10 ? [token.tokenString substringToIndex:10] : token.tokenString ?: @"(nil)",
-          (unsigned long)token.tokenString.length,
-          token.userID ?: @"(nil)",
-          token.appID ?: @"(nil)");
 
     NSTimeInterval dataAccessExpirationTimeInterval = token.dataAccessExpirationDate.timeIntervalSince1970;
     NSString *dataAccessExpirationTime = @"0";
@@ -940,6 +978,25 @@
                                   };
 
     return [response copy];
+}
+
+// Returns a Limited Login response shaped like a standard login response
+// so the JS client can read authResponse.accessToken transparently.
+- (NSDictionary *)limitedLoginCompatibleResponseObject {
+    if (![FBSDKAuthenticationToken currentAuthenticationToken]) {
+        return @{@"status": @"unknown"};
+    }
+
+    FBSDKAuthenticationToken *token = [FBSDKAuthenticationToken currentAuthenticationToken];
+    NSString *userID = [FBSDKProfile currentProfile] ? [FBSDKProfile currentProfile].userID : @"";
+
+    return @{
+        @"status": @"connected",
+        @"authResponse": @{
+            @"accessToken" : token.tokenString ? token.tokenString : @"",
+            @"userID" : userID
+        }
+    };
 }
 
 - (NSDictionary *)profileObject {
