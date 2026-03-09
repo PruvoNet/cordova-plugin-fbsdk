@@ -32,6 +32,19 @@
 - (void)pluginInitialize {
     NSLog(@"Starting Facebook Connect plugin");
 
+    // One-time migration: clear stale cached tokens from before the cordova-ios 8.0.0
+    // URL callback fix. Without proper notification observers the FBSDK stored invalid
+    // credentials that Facebook's Graph API rejects with "Cannot parse access token".
+    static NSString *const kTokenMigrationKey = @"fbsdk_cordovaios8_token_cleared_v1";
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:kTokenMigrationKey]) {
+        NSLog(@"FB: Clearing stale cached token (one-time cordova-ios 8 migration)");
+        [FBSDKAccessToken setCurrentAccessToken:nil];
+        [FBSDKAuthenticationToken setCurrentAuthenticationToken:nil];
+        [FBSDKProfile setCurrentProfile:nil];
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:kTokenMigrationKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }
+
     // cordova-ios 8.0.0+ uses a scene-based lifecycle where
     // UIApplicationDidFinishLaunchingNotification fires before plugins are initialized.
     // Always initialize the SDK directly — safe to call multiple times.
@@ -102,6 +115,7 @@
 - (void) handleOpenURL:(NSNotification *) notification {
     NSURL *url = notification.object;
     NSDictionary *options = notification.userInfo ?: @{};
+    NSLog(@"FB handleOpenURL (new): url=%@ sourceApp=%@", url, options[@"sourceApplication"] ?: @"(nil)");
     [[FBSDKApplicationDelegate sharedInstance] application:[UIApplication sharedApplication] openURL:url options:options];
 }
 
@@ -109,7 +123,7 @@
 - (void) handleOpenURLWithAppSourceAndAnnotation:(NSNotification *) notification {
     NSMutableDictionary * options = [notification object];
     NSURL* url = options[@"url"];
-
+    NSLog(@"FB handleOpenURLWithAppSourceAndAnnotation (legacy): url=%@", url);
     [[FBSDKApplicationDelegate sharedInstance] application:[UIApplication sharedApplication] openURL:url options:options];
 }
 
@@ -868,11 +882,18 @@
 - (NSDictionary *)loginResponseObject {
 
     if (![FBSDKAccessToken currentAccessToken]) {
+        NSLog(@"FB loginResponseObject: currentAccessToken is nil — returning unknown");
         return @{@"status": @"unknown"};
     }
 
     NSMutableDictionary *response = [[NSMutableDictionary alloc] init];
     FBSDKAccessToken *token = [FBSDKAccessToken currentAccessToken];
+
+    NSLog(@"FB loginResponseObject: tokenString prefix=%@ length=%lu userID=%@ appID=%@",
+          token.tokenString.length > 10 ? [token.tokenString substringToIndex:10] : token.tokenString ?: @"(nil)",
+          (unsigned long)token.tokenString.length,
+          token.userID ?: @"(nil)",
+          token.appID ?: @"(nil)");
 
     NSTimeInterval dataAccessExpirationTimeInterval = token.dataAccessExpirationDate.timeIntervalSince1970;
     NSString *dataAccessExpirationTime = @"0";
