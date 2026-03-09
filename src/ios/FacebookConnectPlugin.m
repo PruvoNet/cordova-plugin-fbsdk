@@ -55,6 +55,25 @@
     if (!FBSDKSettings.sharedSettings.displayName.length && plistDisplayName.length) {
         [FBSDKSettings.sharedSettings setDisplayName:plistDisplayName];
     }
+
+    // Fallback for traditional (non-scene) lifecycle
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(applicationDidFinishLaunching:)
+                                                 name:UIApplicationDidFinishLaunchingNotification object:nil];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(applicationDidBecomeActive:)
+                                                 name:UIApplicationDidBecomeActiveNotification object:nil];
+
+    // cordova-ios 8.0.0+ URL handling (object=NSURL, userInfo=options)
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleOpenURL:)
+                                                 name:CDVPluginHandleOpenURLNotification object:nil];
+
+    // Legacy URL handling for cordova-ios < 8.0.0 (object=NSDictionary with url key)
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                         selector:@selector(handleOpenURLWithAppSourceAndAnnotation:)
+                                             name:CDVPluginHandleOpenURLWithAppSourceAndAnnotationNotification object:nil];
 }
 
 - (void) applicationDidFinishLaunching:(NSNotification *) notification {
@@ -79,6 +98,14 @@
     }
 }
 
+// cordova-ios 8.0.0+: notification.object is NSURL, userInfo contains options
+- (void) handleOpenURL:(NSNotification *) notification {
+    NSURL *url = notification.object;
+    NSDictionary *options = notification.userInfo ?: @{};
+    [[FBSDKApplicationDelegate sharedInstance] application:[UIApplication sharedApplication] openURL:url options:options];
+}
+
+// cordova-ios < 8.0.0: notification.object is NSDictionary with url, sourceApplication, annotation keys
 - (void) handleOpenURLWithAppSourceAndAnnotation:(NSNotification *) notification {
     NSMutableDictionary * options = [notification object];
     NSURL* url = options[@"url"];
